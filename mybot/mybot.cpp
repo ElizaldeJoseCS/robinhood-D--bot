@@ -86,6 +86,7 @@ int main() {
                         double equity = data["equity"].get<double>();
                         double market_val = data["market_value"].get<double>();
                         double crypto_equity = data["crypto_equity"];
+                        double total_equity = data["total_equity"];
 
                         // Build an attractive Discord embed with the data
                         dpp::embed embed = dpp::embed()
@@ -93,6 +94,7 @@ int main() {
                             .set_title("📈 Robinhood Portfolio Status")
                             .add_field("Stocks Equity", "$" + std::to_string(equity), true)
                             .add_field("Crypto Equity", "$" + std::to_string(crypto_equity), true)
+                            .add_field("Total Equity", "$" + std::to_string(total_equity), true)
                             .add_field("Market Value", "$" + std::to_string(market_val), true)
                             .set_timestamp(time(0));
 
