@@ -152,7 +152,7 @@ int main() {
                     bot.message_create(dpp::message(458099654186369025, "Error parsing portfolio loop callback metrics."));
                 }
             });
-        }, 7200);
+        }, 18000);
     });
 
     bot.start(dpp::st_wait);
