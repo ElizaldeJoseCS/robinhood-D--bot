@@ -1,0 +1,58 @@
+# Python Virtual Environments & Packages
+.venv/
+*venv/
+ENV/
+8env/
+bin/
+lib/
+include/
+share/
+pyvenv.cfg
+*.pyc
+*__pycache__/
+.pytest_cache/
+
+# C++ Compilation & Build Artifacts
+# Object files, libraries, and dependency tracks
+*.o
+*.obj
+*.d
+*.a
+*.la
+*.lo
+*.so
+*.so.*
+*.dll
+*.dylib
+
+# Specific compiled binary outputs from your project compilation steps
+market_bot
+*mybot
+*test
+
+# Credentials, Tokens, & Environments
+credentials.py
+.env
+*.env
+.secret
+secrets.*
+
+# System & Editor Configurations
+# macOS clutter
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux trash
+*~
+.fuse_hidden*
+.directory
+
+# Neovim / Emacs / VS Code temporary workspace backups
+.swp
+*.swp
+*.swo
+.idea/
+.vscode/
+.clangd/
+.cache/
