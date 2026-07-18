@@ -182,10 +182,10 @@ def get_portfolio():
             if profile_positions:
                 for position in profile_positions:
                     quantity = float(position['quantity'])
-                        if quantity > 0: 
-                            name = position['currency']['code']
-                            curr_price = float(r.crypto.get_crypto_quote(name)['mark_price'])
-                            total_crypto_equity += (quantity * curr_price)
+                    if quantity > 0: 
+                        name = position['currency']['code']
+                        curr_price = float(r.crypto.get_crypto_quote(name)['mark_price'])
+                        total_crypto_equity += (quantity * curr_price)
 
             return {
                 "status": "success",
