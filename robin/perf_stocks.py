@@ -164,15 +164,28 @@ def get_portfolio():
     with rh_api_lock:
         try:
             profile_stocks = r.profiles.load_portfolio_profile()
+            if profile_stocks is None or not isinstance(profile_stocks, dict) or 'equity' not in profile_stocks:
+                print("Robinhood session expired: Attemping to re-log in")
+                r.login(username=os.getenv("ROBINHOOD_USER", username), 
+                    password=os.getenv("ROBINHOOD_PASS", password), 
+                    expiresIn=86400)
+                profile_stocks = r.profiles.load_portfolio_profile()
+                if profile_stocks is None:
+                    return {"status": "error", "message": "Robinhood authentication token expired and re-login failed."}
+                print("Logged into Robinhood successfully.")
+                
+
+
             profile_positions = r.crypto.get_crypto_positions()
         
             total_crypto_equity = 0.0
-            for position in profile_positions:
-                quantity = float(position['quantity'])
-                if quantity > 0: 
-                    name = position['currency']['code']
-                    curr_price = float(r.crypto.get_crypto_quote(name)['mark_price'])
-                    total_crypto_equity += (quantity * curr_price)
+            if profile_positions:
+                for position in profile_positions:
+                    quantity = float(position['quantity'])
+                        if quantity > 0: 
+                            name = position['currency']['code']
+                            curr_price = float(r.crypto.get_crypto_quote(name)['mark_price'])
+                            total_crypto_equity += (quantity * curr_price)
 
             return {
                 "status": "success",
