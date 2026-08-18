@@ -1,6 +1,8 @@
 import threading
 import time
 import os
+import pickle
+import requests
 from fastapi import FastAPI
 import pandas as pd
 import yfinance as yf
@@ -8,6 +10,9 @@ import robin_stocks.robinhood as r
 
 username = os.environ["ROBINHOOD_USER"]
 password = os.environ["ROBINHOOD_PASS"]
+
+TOKEN_LIFETIME = 6 * 3600  # re-login every 6 hours (token lasts ~7 days)
+last_login_time = 0
 
 app = FastAPI()
 
@@ -25,6 +30,57 @@ cache_lock = threading.Lock()
 
 # Lock to protect Robinhood session API requests
 rh_api_lock = threading.Lock()
+
+
+def refresh_robinhood_token():
+    """Use the stored refresh_token to get a new access_token without full re-login."""
+    pickle_path = os.path.expanduser("~/.tokens/robinhood.pickle")
+    if not os.path.exists(pickle_path):
+        return False
+    try:
+        with open(pickle_path, 'rb') as f:
+            data = pickle.load(f)
+        resp = requests.post("https://api.robinhood.com/oauth2/token/", data={
+            "grant_type": "refresh_token",
+            "refresh_token": data["refresh_token"],
+            "client_id": "c82SH0WZOsabOXGP2sxqcj34FxkvfnWRZBKlBjFS",
+            "device_token": data["device_token"],
+        })
+        if resp.status_code == 200:
+            new_data = resp.json()
+            r.helpers.update_session('Authorization', f'{new_data["token_type"]} {new_data["access_token"]}')
+            with open(pickle_path, 'wb') as f:
+                pickle.dump({
+                    "token_type": new_data["token_type"],
+                    "access_token": new_data["access_token"],
+                    "refresh_token": new_data["refresh_token"],
+                    "device_token": data["device_token"],
+                }, f)
+            print("✅ Robinhood token refreshed successfully.")
+            return True
+    except Exception as e:
+        print(f"⚠️ Token refresh failed: {e}")
+    return False
+
+
+def ensure_authenticated():
+    """Proactively re-authenticate before the token expires."""
+    global last_login_time
+    with rh_api_lock:
+        if time.time() - last_login_time < TOKEN_LIFETIME:
+            return  # Still valid, skip
+        # Try refresh first (no MFA needed)
+        if refresh_robinhood_token():
+            last_login_time = time.time()
+            return
+        # Refresh failed — full re-login
+        try:
+            print("Proactive re-login to Robinhood...")
+            r.login(username=username, password=password, expiresIn=604800)
+            last_login_time = time.time()
+            print("✅ Re-logged into Robinhood successfully.")
+        except Exception as e:
+            print(f"❌ Proactive re-login failed: {e}")
 
 
 @app.on_event("startup")
@@ -55,7 +111,8 @@ def initialization_and_pipeline_worker():
             print("Logging into Robinhood in background thread...")
             r.login(username=username, 
                     password=password, 
-                    expiresIn=86400)
+                    expiresIn=604800)
+            last_login_time = time.time()
             print("✅ Logged into Robinhood successfully.")
         except Exception as auth_err:
             print(f"❌ Critical error logging into Robinhood: {auth_err}")
@@ -63,6 +120,7 @@ def initialization_and_pipeline_worker():
 
     # 2. Transition straight into your infinite market scanning loop
     while True:
+        ensure_authenticated()
         print("⚡ Starting Stock Evaluation Pipeline...")
         try:
             tickers = get_sp500_tickers()
@@ -145,8 +203,8 @@ def initialization_and_pipeline_worker():
         except Exception as global_err:
             print(f"Critical error encountered in background pipeline: {global_err}")
         
-        # Sleep thread for 24 hours before refreshing calculations
-        time.sleep(86400)
+        # Sleep 6 hours before refreshing (token is valid for ~7 days)
+        time.sleep(21600)
 
 
 # ----------------------------------------------------
@@ -170,7 +228,7 @@ def get_portfolio():
                 print("Robinhood session expired: Attemping to re-log in")
                 r.login(username=username, 
                         password=password, 
-                        expiresIn=86400)
+                        expiresIn=604800)
                 profile_stocks = r.profiles.load_portfolio_profile()
                 if profile_stocks is None:
                     return {"status": "error", "message": "Robinhood authentication token expired and re-login failed."}
