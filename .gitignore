@@ -42,7 +42,7 @@ secrets.*
 .DS_Store
 .AppleDouble
 .LSOverride
-
+AGENTS.md
 # Linux trash
 *~
 .fuse_hidden*
