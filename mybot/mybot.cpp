@@ -121,7 +121,7 @@ int main() {
     });
 
     // Register slash commands to Discord on startup
-    bot.on_ready([&bot](const dpp::ready_t& event) {
+    bot.on_ready([&bot, my_guild_id, my_channel_id](const dpp::ready_t& event) {
         if (dpp::run_once<struct register_bot_commands>()) {
             dpp::slashcommand portfolio("portfolio", "Check current Robinhood portfolio performance", bot.me.id);
             dpp::slashcommand recommend("recommend", "Recommendations of stocks to buy", bot.me.id);
@@ -129,8 +129,8 @@ int main() {
         }
 
         // Every 2 hours (7200 seconds), send a bot message status report
-        bot.start_timer([&bot](const dpp::timer& timer) {
-            bot.request("http://127.0.0.1:8000/portfolio", dpp::m_get, [&bot](const dpp::http_request_completion_t& callback) {
+        bot.start_timer([&bot, my_channel_id](const dpp::timer& timer) {
+            bot.request("http://127.0.0.1:8000/portfolio", dpp::m_get, [&bot, my_channel_id](const dpp::http_request_completion_t& callback) {
                 if (callback.status != 200) {
                     bot.message_create(dpp::message(my_channel_id, "Failed to contact the portfolio microservice."));
                     return;
