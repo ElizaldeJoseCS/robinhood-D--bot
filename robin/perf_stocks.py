@@ -5,7 +5,9 @@ from fastapi import FastAPI
 import pandas as pd
 import yfinance as yf
 import robin_stocks.robinhood as r
-from credentials import username, password
+
+username = os.environ["ROBINHOOD_USER"]
+password = os.environ["ROBINHOOD_PASS"]
 
 app = FastAPI()
 
@@ -51,8 +53,8 @@ def initialization_and_pipeline_worker():
     with rh_api_lock:
         try:
             print("Logging into Robinhood in background thread...")
-            r.login(username=os.getenv("ROBINHOOD_USER", username), 
-                    password=os.getenv("ROBINHOOD_PASS", password), 
+                r.login(username=username, 
+                    password=password, 
                     expiresIn=86400)
             print("✅ Logged into Robinhood successfully.")
         except Exception as auth_err:
@@ -166,8 +168,8 @@ def get_portfolio():
             profile_stocks = r.profiles.load_portfolio_profile()
             if profile_stocks is None or not isinstance(profile_stocks, dict) or 'equity' not in profile_stocks:
                 print("Robinhood session expired: Attemping to re-log in")
-                r.login(username=os.getenv("ROBINHOOD_USER", username), 
-                    password=os.getenv("ROBINHOOD_PASS", password), 
+            r.login(username=username, 
+                    password=password, 
                     expiresIn=86400)
                 profile_stocks = r.profiles.load_portfolio_profile()
                 if profile_stocks is None:

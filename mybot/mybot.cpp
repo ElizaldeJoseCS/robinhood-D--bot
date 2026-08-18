@@ -1,14 +1,25 @@
 #include <dpp/dpp.h>
 #include <nlohmann/json.hpp>
 #include <iostream>
-#include <string> 
+#include <string>
+#include <cstdlib>
 
-const std::string BOT_TOKEN = "REDACTED";
 using json = nlohmann::json;
 
 int main() {
-    // Instantiate your bot cluster using your Discord Token
-    dpp::cluster bot(BOT_TOKEN);
+    const char* token = std::getenv("DISCORD_BOT_TOKEN");
+    const char* guild_id_str = std::getenv("GUILD_ID");
+    const char* channel_id_str = std::getenv("CHANNEL_ID");
+
+    if (!token || !guild_id_str || !channel_id_str) {
+        std::cerr << "Missing required environment variables. Set DISCORD_BOT_TOKEN, GUILD_ID, and CHANNEL_ID in your .env file.\n";
+        return 1;
+    }
+
+    dpp::snowflake my_guild_id = std::stoull(guild_id_str);
+    dpp::snowflake my_channel_id = std::stoull(channel_id_str);
+
+    dpp::cluster bot(token);
 
     bot.on_log(dpp::utility::cout_logger());
     
@@ -114,7 +125,6 @@ int main() {
         if (dpp::run_once<struct register_bot_commands>()) {
             dpp::slashcommand portfolio("portfolio", "Check current Robinhood portfolio performance", bot.me.id);
             dpp::slashcommand recommend("recommend", "Recommendations of stocks to buy", bot.me.id);
-            dpp::snowflake my_guild_id = 458099653267947521;
             bot.guild_bulk_command_create({ portfolio, recommend }, my_guild_id);
         }
 
@@ -122,7 +132,7 @@ int main() {
         bot.start_timer([&bot](const dpp::timer& timer) {
             bot.request("http://127.0.0.1:8000/portfolio", dpp::m_get, [&bot](const dpp::http_request_completion_t& callback) {
                 if (callback.status != 200) {
-                    bot.message_create(dpp::message(458099654186369025, "Failed to contact the portfolio microservice."));
+                    bot.message_create(dpp::message(my_channel_id, "Failed to contact the portfolio microservice."));
                     return;
                 }
                 try {
@@ -143,13 +153,13 @@ int main() {
                             .add_field("Market Value", "$" + std::to_string(market_val), true)
                             .set_timestamp(time(0));
 
-                        bot.message_create(dpp::message(458099654186369025, embed));
+                        bot.message_create(dpp::message(my_channel_id, embed));
                     } else {
-                        bot.message_create(dpp::message(458099654186369025, "Error updating portfolio tracker."));
+                        bot.message_create(dpp::message(my_channel_id, "Error updating portfolio tracker."));
                     }
                 } 
                 catch (const std::exception& e) {
-                    bot.message_create(dpp::message(458099654186369025, "Error parsing portfolio loop callback metrics."));
+                    bot.message_create(dpp::message(my_channel_id, "Error parsing portfolio loop callback metrics."));
                 }
             });
         }, 18000);
