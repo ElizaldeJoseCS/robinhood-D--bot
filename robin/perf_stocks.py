@@ -11,7 +11,7 @@ import robin_stocks.robinhood as r
 username = os.environ["ROBINHOOD_USER"]
 password = os.environ["ROBINHOOD_PASS"]
 
-TOKEN_LIFETIME = 6 * 3600  # re-login every 6 hours (token lasts ~7 days)
+TOKEN_LIFETIME = 23 * 3600  # re-login every 23 hours (token lasts ~7 days)
 last_login_time = 0
 
 app = FastAPI()
@@ -43,11 +43,16 @@ def refresh_robinhood_token():
         resp = requests.post("https://api.robinhood.com/oauth2/token/", data={
             "grant_type": "refresh_token",
             "refresh_token": data["refresh_token"],
+            "scope": "internal",
             "client_id": "c82SH0WZOsabOXGP2sxqcj34FxkvfnWRZBKlBjFS",
             "device_token": data["device_token"],
+            "expires_in": 86400,
         })
         if resp.status_code == 200:
             new_data = resp.json()
+            if "verification_workflow" in new_data:
+                print("Refresh Token has expired - full relogin required")
+                return False
             r.helpers.update_session('Authorization', f'{new_data["token_type"]} {new_data["access_token"]}')
             with open(pickle_path, 'wb') as f:
                 pickle.dump({
@@ -58,8 +63,10 @@ def refresh_robinhood_token():
                 }, f)
             print("✅ Robinhood token refreshed successfully.")
             return True
+        else:
+            print(f" Refresh failed (HTTP {resp.status_code}): {resp.text}")
     except Exception as e:
-        print(f"⚠️ Token refresh failed: {e}")
+        print(f" Token refresh failed: {e}")
     return False
 
 
