@@ -53,7 +53,7 @@ def initialization_and_pipeline_worker():
     with rh_api_lock:
         try:
             print("Logging into Robinhood in background thread...")
-                r.login(username=username, 
+            r.login(username=username, 
                     password=password, 
                     expiresIn=86400)
             print("✅ Logged into Robinhood successfully.")
@@ -168,9 +168,9 @@ def get_portfolio():
             profile_stocks = r.profiles.load_portfolio_profile()
             if profile_stocks is None or not isinstance(profile_stocks, dict) or 'equity' not in profile_stocks:
                 print("Robinhood session expired: Attemping to re-log in")
-            r.login(username=username, 
-                    password=password, 
-                    expiresIn=86400)
+                r.login(username=username, 
+                        password=password, 
+                        expiresIn=86400)
                 profile_stocks = r.profiles.load_portfolio_profile()
                 if profile_stocks is None:
                     return {"status": "error", "message": "Robinhood authentication token expired and re-login failed."}
