@@ -1,6 +1,7 @@
 import threading
 import time
 import os
+import json
 import pickle
 import requests
 from fastapi import FastAPI
@@ -13,6 +14,30 @@ password = os.environ["ROBINHOOD_PASS"]
 
 TOKEN_LIFETIME = 23 * 3600  # re-login every 23 hours (token lasts ~7 days)
 last_login_time = 0
+LOGIN_TIMESTAMP_PATH = os.path.expanduser("~/.tokens/last_login.json")
+
+
+def load_login_timestamp():
+    """Load last_login_time from disk so restarts don't force unnecessary re-login."""
+    global last_login_time
+    try:
+        if os.path.exists(LOGIN_TIMESTAMP_PATH):
+            with open(LOGIN_TIMESTAMP_PATH, 'r') as f:
+                last_login_time = json.load(f).get("last_login", 0)
+    except Exception:
+        pass
+
+
+def save_login_timestamp():
+    """Persist last_login_time to disk."""
+    try:
+        with open(LOGIN_TIMESTAMP_PATH, 'w') as f:
+            json.dump({"last_login": last_login_time}, f)
+    except Exception:
+        pass
+
+
+load_login_timestamp()
 
 app = FastAPI()
 
@@ -79,12 +104,14 @@ def ensure_authenticated():
         # Try refresh first (no MFA needed)
         if refresh_robinhood_token():
             last_login_time = time.time()
+            save_login_timestamp()
             return
         # Refresh failed — full re-login
         try:
             print("Proactive re-login to Robinhood...")
             r.login(username=username, password=password, expiresIn=604800)
             last_login_time = time.time()
+            save_login_timestamp()
             print("✅ Re-logged into Robinhood successfully.")
         except Exception as e:
             print(f"❌ Proactive re-login failed: {e}")
@@ -112,6 +139,7 @@ def get_sp500_tickers():
 
 def initialization_and_pipeline_worker():
     """Handles async authentication on boot, then transitions into the 24-hour analysis loop."""
+    global last_login_time
     # 1. Handle Robinhood Login asynchronously in the background thread
     with rh_api_lock:
         try:
@@ -120,6 +148,7 @@ def initialization_and_pipeline_worker():
                     password=password, 
                     expiresIn=604800)
             last_login_time = time.time()
+            save_login_timestamp()
             print("✅ Logged into Robinhood successfully.")
         except Exception as auth_err:
             print(f"❌ Critical error logging into Robinhood: {auth_err}")
@@ -215,7 +244,7 @@ def initialization_and_pipeline_worker():
 
 
 # ----------------------------------------------------
-# FASTAPI ENDPOINTS (Accessed instantly by your C++ Bot)
+# FASTAPI ENDPOINTS (Accessed instantly by C++ Bot)
 # ----------------------------------------------------
 
 @app.get("/recommendations")
@@ -228,6 +257,7 @@ def get_recommendations():
 @app.get("/portfolio")
 def get_portfolio():
     """Fetches user active portfolio metrics dynamically using Robinhood session."""
+    global last_login_time
     with rh_api_lock:
         try:
             profile_stocks = r.profiles.load_portfolio_profile()
@@ -236,6 +266,8 @@ def get_portfolio():
                 r.login(username=username, 
                         password=password, 
                         expiresIn=604800)
+                last_login_time = time.time()
+                save_login_timestamp()
                 profile_stocks = r.profiles.load_portfolio_profile()
                 if profile_stocks is None:
                     return {"status": "error", "message": "Robinhood authentication token expired and re-login failed."}
