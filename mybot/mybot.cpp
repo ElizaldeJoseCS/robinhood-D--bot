@@ -30,7 +30,6 @@ int main() {
             // Inform Discord we need an extra second to process this command
             event.thinking();
 
-            // FIX: Added &bot to capture group to stabilize network lifecycle pointers
             bot.request("http://127.0.0.1:8000/portfolio", dpp::m_get, [&bot, event](const dpp::http_request_completion_t& response) {
                 // Check if HTTP transfer was successful
                 if (response.status != 200) {
@@ -41,9 +40,7 @@ int main() {
                 try {
                     // Parse the raw response body using nlohmann/json
                     auto data = json::parse(response.body);
-                    std::cout << "Parsing rn: \n";
                     if (data["status"] == "success") {
-                        std::cout << "SUCCESS\n";
                         double equity = data["equity"].get<double>();
                         double market_val = data["market_value"].get<double>();
                         double crypto_equity = data["crypto_equity"].get<double>();
@@ -128,7 +125,7 @@ int main() {
             bot.guild_bulk_command_create({ portfolio, recommend }, my_guild_id);
         }
 
-        // Every 2 hours (7200 seconds), send a bot message status report
+        // Every 5 hours (18000 seconds), send a bot message status report
         bot.start_timer([&bot, my_channel_id](const dpp::timer& timer) {
             bot.request("http://127.0.0.1:8000/portfolio", dpp::m_get, [&bot, my_channel_id](const dpp::http_request_completion_t& callback) {
                 if (callback.status != 200) {
