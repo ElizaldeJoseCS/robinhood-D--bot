@@ -105,7 +105,7 @@ def refresh_robinhood_token():
             if "verification_workflow" in new_data:
                 log.warning("Robinhood returned verification_workflow — refresh token expired")
                 return False
-            r.helpers.update_session('Authorization', f'{new_data["token_type"]} {new_data["access_token"]}')
+            r.update_session('Authorization', f'{new_data["token_type"]} {new_data["access_token"]}')
             with open(pickle_path, 'wb') as f:
                 pickle.dump({
                     "token_type": new_data["token_type"],
