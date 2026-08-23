@@ -1,16 +1,23 @@
 import threading
 import time
 import os
+import sys
 import json
 import pickle
+import logging
 import requests
 from fastapi import FastAPI
 import pandas as pd
 import yfinance as yf
 import robin_stocks.robinhood as r
 
+logging.basicConfig(stream=sys.stderr, level=logging.INFO, format='[%(levelname)s] %(message)s')
+log = logging.getLogger("stocks-backend")
+
 username = os.environ["ROBINHOOD_USER"]
 password = os.environ["ROBINHOOD_PASS"]
+DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
+DISCORD_CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
 
 TOKEN_LIFETIME = 23 * 3600  # re-login every 23 hours (token lasts ~7 days)
 last_login_time = 0
@@ -57,14 +64,34 @@ cache_lock = threading.Lock()
 rh_api_lock = threading.RLock()
 
 
+def send_discord_alert(message):
+    """Send an alert to the Discord channel via the bot token."""
+    if not DISCORD_BOT_TOKEN or not DISCORD_CHANNEL_ID:
+        return
+    try:
+        requests.post(
+            f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages",
+            headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"},
+            json={"content": message},
+            timeout=10,
+        )
+    except Exception as e:
+        log.warning(f"Failed to send Discord alert: {e}")
+
+
 def refresh_robinhood_token():
     """Use the stored refresh_token to get a new access_token without full re-login."""
     pickle_path = os.path.expanduser("~/.tokens/robinhood.pickle")
     if not os.path.exists(pickle_path):
+        log.warning("No pickle file found at %s", pickle_path)
         return False
     try:
         with open(pickle_path, 'rb') as f:
             data = pickle.load(f)
+        missing = [k for k in ("token_type", "access_token", "refresh_token", "device_token") if k not in data]
+        if missing:
+            log.warning("Pickle missing keys: %s", missing)
+            return False
         resp = requests.post("https://api.robinhood.com/oauth2/token/", data={
             "grant_type": "refresh_token",
             "refresh_token": data["refresh_token"],
@@ -72,11 +99,11 @@ def refresh_robinhood_token():
             "client_id": "c82SH0WZOsabOXGP2sxqcj34FxkvfnWRZBKlBjFS",
             "device_token": data["device_token"],
             "expires_in": 86400,
-        })
+        }, timeout=15)
         if resp.status_code == 200:
             new_data = resp.json()
             if "verification_workflow" in new_data:
-                print("Refresh Token has expired - full relogin required")
+                log.warning("Robinhood returned verification_workflow — refresh token expired")
                 return False
             r.helpers.update_session('Authorization', f'{new_data["token_type"]} {new_data["access_token"]}')
             with open(pickle_path, 'wb') as f:
@@ -86,12 +113,12 @@ def refresh_robinhood_token():
                     "refresh_token": new_data["refresh_token"],
                     "device_token": data["device_token"],
                 }, f)
-            print("✅ Robinhood token refreshed successfully.")
+            log.info("Robinhood token refreshed successfully")
             return True
         else:
-            print(f" Refresh failed (HTTP {resp.status_code}): {resp.text}")
+            log.error("Refresh failed — HTTP %d: %s", resp.status_code, resp.text[:300])
     except Exception as e:
-        print(f" Token refresh failed: {e}")
+        log.error("Refresh exception: %s", e)
     return False
 
 
@@ -107,14 +134,16 @@ def ensure_authenticated():
             save_login_timestamp()
             return
         # Refresh failed — full re-login
+        send_discord_alert("Robinhood refresh token expired — performing full re-login. You may get a security notification.")
         try:
-            print("Proactive re-login to Robinhood...")
+            log.info("Proactive re-login to Robinhood...")
             r.login(username=username, password=password, expiresIn=604800)
             last_login_time = time.time()
             save_login_timestamp()
-            print("✅ Re-logged into Robinhood successfully.")
+            log.info("Re-logged into Robinhood successfully")
         except Exception as e:
-            print(f"❌ Proactive re-login failed: {e}")
+            log.error("Proactive re-login failed: %s", e)
+            send_discord_alert(f"Robinhood re-login FAILED: {e}")
 
 
 @app.on_event("startup")
@@ -133,7 +162,7 @@ def get_sp500_tickers():
         tickers = tables[0]['Symbol'].tolist()
         return [t.replace('.', '-') for t in tickers]
     except Exception as e:
-        print(f"Error scraping S&P 500 list: {e}")
+        log.error("Error scraping S&P 500 list: %s", e)
         return ["AAPL", "NVDA", "MSFT", "AMZN", "GOOGL", "META", "TSLA"] # Fallback subset
 
 
@@ -145,21 +174,23 @@ def initialization_and_pipeline_worker():
         try:
             # Always try silent refresh first — avoids notifications on restarts
             if refresh_robinhood_token():
-                print("✅ Restored Robinhood session from pickle (no re-login).")
+                log.info("Restored Robinhood session from pickle (no re-login).")
             else:
-                print("Refresh token expired or missing, doing full login...")
+                log.info("Refresh token expired or missing, doing full login...")
+                send_discord_alert("Robinhood session invalid — performing full re-login. You may get a security notification.")
                 r.login(username=username, password=password, expiresIn=604800)
                 last_login_time = time.time()
                 save_login_timestamp()
-                print("✅ Logged into Robinhood successfully.")
+                log.info("Logged into Robinhood successfully.")
         except Exception as auth_err:
-            print(f"❌ Critical error logging into Robinhood: {auth_err}")
+            log.error("Critical error logging into Robinhood: %s", auth_err)
+            send_discord_alert(f"Robinhood login FAILED: {auth_err}")
             return  # Kill the thread if credentials fail completely
 
     # 2. Transition straight into your infinite market scanning loop
     while True:
         ensure_authenticated()
-        print("⚡ Starting Stock Evaluation Pipeline...")
+        log.info("Starting Stock Evaluation Pipeline...")
         try:
             tickers = get_sp500_tickers()
             
@@ -199,7 +230,7 @@ def initialization_and_pipeline_worker():
             
             # Sort by highest 1-month return performance and take top 25 for fundamental check
             momentum_pool = sorted(momentum_pool, key=lambda x: x['return_1m'], reverse=True)[:25]
-            print(f"Found {len(momentum_pool)} high momentum stocks. Entering Stage 2 Fundamental analysis...")
+            log.info("Found %d high momentum stocks. Entering Stage 2 Fundamental analysis...", len(momentum_pool))
 
             # ----------------------------------------------------
             # STAGE 2: FUNDAMENTAL HEALTH & DEEP VALUATION SCREEN
@@ -223,7 +254,7 @@ def initialization_and_pipeline_worker():
                         if len(final_winners) >= 5: # We found our Top 5 recommendations
                             break
                 except Exception as e:
-                    print(f"Error checking fundamentals for {ticker}: {e}")
+                    log.error("Error checking fundamentals for %s: %s", ticker, e)
                     continue
 
             # Update Global Cache safely using the Mutex Lock
@@ -236,10 +267,10 @@ def initialization_and_pipeline_worker():
                     "monthly": final_winners[-1:], # Solid long-term hold pick
                     "last_updated": int(time.time())
                 }
-            print(f"Pipeline complete. Top picks cached successfully: {final_winners}")
+            log.info("Pipeline complete. Top picks: %s", final_winners)
 
         except Exception as global_err:
-            print(f"Critical error encountered in background pipeline: {global_err}")
+            log.error("Critical error in background pipeline: %s", global_err)
         
         # Sleep 6 hours before refreshing (token is valid for ~7 days)
         time.sleep(21600)
@@ -265,16 +296,17 @@ def get_portfolio():
         try:
             profile_stocks = r.profiles.load_portfolio_profile()
             if profile_stocks is None or not isinstance(profile_stocks, dict) or 'equity' not in profile_stocks:
-                print("Robinhood session expired: Attempting silent refresh...")
+                log.warning("Robinhood session expired: Attempting silent refresh...")
                 if not refresh_robinhood_token():
-                    print("Refresh failed, doing full re-login...")
+                    log.warning("Refresh failed, doing full re-login...")
+                    send_discord_alert("Robinhood session expired on /portfolio — full re-login triggered.")
                     r.login(username=username, password=password, expiresIn=604800)
                 last_login_time = time.time()
                 save_login_timestamp()
                 profile_stocks = r.profiles.load_portfolio_profile()
                 if profile_stocks is None:
                     return {"status": "error", "message": "Robinhood authentication token expired and re-login failed."}
-                print("Logged into Robinhood successfully.")
+                log.info("Logged into Robinhood successfully.")
                 
 
 
