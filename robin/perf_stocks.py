@@ -54,7 +54,7 @@ RECOMMENDATIONS_CACHE = {
 cache_lock = threading.Lock()
 
 # Lock to protect Robinhood session API requests
-rh_api_lock = threading.Lock()
+rh_api_lock = threading.RLock()
 
 
 def refresh_robinhood_token():
@@ -259,10 +259,11 @@ def get_portfolio():
     """Fetches user active portfolio metrics dynamically using Robinhood session."""
     global last_login_time
     with rh_api_lock:
+        ensure_authenticated()
         try:
             profile_stocks = r.profiles.load_portfolio_profile()
             if profile_stocks is None or not isinstance(profile_stocks, dict) or 'equity' not in profile_stocks:
-                print("Robinhood session expired: Attemping to re-log in")
+                print("Robinhood session expired: Attempting to re-log in")
                 r.login(username=username, 
                         password=password, 
                         expiresIn=604800)
