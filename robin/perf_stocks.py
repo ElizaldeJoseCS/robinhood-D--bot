@@ -143,13 +143,22 @@ def initialization_and_pipeline_worker():
     # 1. Handle Robinhood Login asynchronously in the background thread
     with rh_api_lock:
         try:
-            print("Logging into Robinhood in background thread...")
-            r.login(username=username, 
-                    password=password, 
-                    expiresIn=604800)
-            last_login_time = time.time()
-            save_login_timestamp()
-            print("✅ Logged into Robinhood successfully.")
+            if time.time() - last_login_time < TOKEN_LIFETIME:
+                # Token still within window — try silent refresh, no notification
+                if refresh_robinhood_token():
+                    print("✅ Restored Robinhood session from pickle (no re-login).")
+                else:
+                    print("Token fresh but refresh failed, attempting full login...")
+                    r.login(username=username, password=password, expiresIn=604800)
+                    last_login_time = time.time()
+                    save_login_timestamp()
+                    print("✅ Logged into Robinhood successfully.")
+            else:
+                print("Logging into Robinhood in background thread...")
+                r.login(username=username, password=password, expiresIn=604800)
+                last_login_time = time.time()
+                save_login_timestamp()
+                print("✅ Logged into Robinhood successfully.")
         except Exception as auth_err:
             print(f"❌ Critical error logging into Robinhood: {auth_err}")
             return  # Kill the thread if credentials fail completely
@@ -263,10 +272,10 @@ def get_portfolio():
         try:
             profile_stocks = r.profiles.load_portfolio_profile()
             if profile_stocks is None or not isinstance(profile_stocks, dict) or 'equity' not in profile_stocks:
-                print("Robinhood session expired: Attempting to re-log in")
-                r.login(username=username, 
-                        password=password, 
-                        expiresIn=604800)
+                print("Robinhood session expired: Attempting silent refresh...")
+                if not refresh_robinhood_token():
+                    print("Refresh failed, doing full re-login...")
+                    r.login(username=username, password=password, expiresIn=604800)
                 last_login_time = time.time()
                 save_login_timestamp()
                 profile_stocks = r.profiles.load_portfolio_profile()
