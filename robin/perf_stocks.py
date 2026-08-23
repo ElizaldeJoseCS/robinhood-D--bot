@@ -143,18 +143,11 @@ def initialization_and_pipeline_worker():
     # 1. Handle Robinhood Login asynchronously in the background thread
     with rh_api_lock:
         try:
-            if time.time() - last_login_time < TOKEN_LIFETIME:
-                # Token still within window — try silent refresh, no notification
-                if refresh_robinhood_token():
-                    print("✅ Restored Robinhood session from pickle (no re-login).")
-                else:
-                    print("Token fresh but refresh failed, attempting full login...")
-                    r.login(username=username, password=password, expiresIn=604800)
-                    last_login_time = time.time()
-                    save_login_timestamp()
-                    print("✅ Logged into Robinhood successfully.")
+            # Always try silent refresh first — avoids notifications on restarts
+            if refresh_robinhood_token():
+                print("✅ Restored Robinhood session from pickle (no re-login).")
             else:
-                print("Logging into Robinhood in background thread...")
+                print("Refresh token expired or missing, doing full login...")
                 r.login(username=username, password=password, expiresIn=604800)
                 last_login_time = time.time()
                 save_login_timestamp()
