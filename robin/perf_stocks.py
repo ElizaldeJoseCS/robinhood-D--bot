@@ -63,6 +63,10 @@ cache_lock = threading.Lock()
 # Lock to protect Robinhood session API requests
 rh_api_lock = threading.RLock()
 
+# True only after the initial background login completes — prevents race condition
+# where /portfolio is served before Robinhood session is established
+session_ready = threading.Event()
+
 
 def send_discord_alert(message):
     """Send an alert to the Discord channel via the bot token."""
@@ -187,6 +191,8 @@ def initialization_and_pipeline_worker():
             send_discord_alert(f"Robinhood login FAILED: {auth_err}")
             return  # Kill the thread if credentials fail completely
 
+    session_ready.set()
+
     # 2. Transition straight into your infinite market scanning loop
     while True:
         ensure_authenticated()
@@ -290,6 +296,8 @@ def get_recommendations():
 @app.get("/portfolio")
 def get_portfolio():
     """Fetches user active portfolio metrics dynamically using Robinhood session."""
+    if not session_ready.is_set():
+        return {"status": "error", "message": "Robinhood session is still initializing, try again in a few seconds."}
     global last_login_time
     with rh_api_lock:
         ensure_authenticated()
