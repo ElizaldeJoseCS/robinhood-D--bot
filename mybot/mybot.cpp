@@ -125,41 +125,45 @@ int main() {
             bot.guild_bulk_command_create({ portfolio, recommend }, my_guild_id);
         }
 
-        // Every 5 hours (18000 seconds), send a bot message status report
-        bot.start_timer([&bot, my_channel_id](const dpp::timer& timer) {
-            bot.request("http://127.0.0.1:8000/portfolio", dpp::m_get, [&bot, my_channel_id](const dpp::http_request_completion_t& callback) {
-                if (callback.status != 200) {
-                    bot.message_create(dpp::message(my_channel_id, "Failed to contact the portfolio microservice."));
-                    return;
-                }
-                try {
-                    auto data = json::parse(callback.body);
-
-                    if (data["status"] == "success") {
-                        double equity = data["equity"].get<double>();
-                        double market_val = data["market_value"].get<double>();
-                        double crypto_equity = data["crypto_equity"].get<double>();
-                        double total_equity = data["total_equity"].get<double>();
-
-                        dpp::embed embed = dpp::embed()
-                            .set_color(dpp::colors::emerald_green)
-                            .set_title("📈 Robinhood Portfolio Status")
-                            .add_field("Stocks Equity", "$" + std::to_string(equity), true)
-                            .add_field("Crypto Equity", "$" + std::to_string(crypto_equity), true)
-                            .add_field("Total Equity", "$" + std::to_string(total_equity), true)
-                            .add_field("Market Value", "$" + std::to_string(market_val), true)
-                            .set_timestamp(time(0));
-
-                        bot.message_create(dpp::message(my_channel_id, embed));
-                    } else {
-                        bot.message_create(dpp::message(my_channel_id, "Error updating portfolio tracker."));
+        // Every 5 hours (18000 seconds), send a bot message status report.
+        // Guarded by run_once: on_ready fires again on every gateway reconnect,
+        // and without this each reconnect would stack another duplicate timer.
+        if (dpp::run_once<struct start_portfolio_timer>()) {
+            bot.start_timer([&bot, my_channel_id](const dpp::timer& timer) {
+                bot.request("http://127.0.0.1:8000/portfolio", dpp::m_get, [&bot, my_channel_id](const dpp::http_request_completion_t& callback) {
+                    if (callback.status != 200) {
+                        bot.message_create(dpp::message(my_channel_id, "Failed to contact the portfolio microservice."));
+                        return;
                     }
-                } 
-                catch (const std::exception& e) {
-                    bot.message_create(dpp::message(my_channel_id, "Error parsing portfolio loop callback metrics."));
-                }
-            });
-        }, 18000);
+                    try {
+                        auto data = json::parse(callback.body);
+
+                        if (data["status"] == "success") {
+                            double equity = data["equity"].get<double>();
+                            double market_val = data["market_value"].get<double>();
+                            double crypto_equity = data["crypto_equity"].get<double>();
+                            double total_equity = data["total_equity"].get<double>();
+
+                            dpp::embed embed = dpp::embed()
+                                .set_color(dpp::colors::emerald_green)
+                                .set_title("📈 Robinhood Portfolio Status")
+                                .add_field("Stocks Equity", "$" + std::to_string(equity), true)
+                                .add_field("Crypto Equity", "$" + std::to_string(crypto_equity), true)
+                                .add_field("Total Equity", "$" + std::to_string(total_equity), true)
+                                .add_field("Market Value", "$" + std::to_string(market_val), true)
+                                .set_timestamp(time(0));
+
+                            bot.message_create(dpp::message(my_channel_id, embed));
+                        } else {
+                            bot.message_create(dpp::message(my_channel_id, "Error updating portfolio tracker."));
+                        }
+                    } 
+                    catch (const std::exception& e) {
+                        bot.message_create(dpp::message(my_channel_id, "Error parsing portfolio loop callback metrics."));
+                    }
+                });
+            }, 18000);
+        }
     });
 
     bot.start(dpp::st_wait);
