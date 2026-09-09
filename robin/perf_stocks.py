@@ -10,6 +10,7 @@ from fastapi import FastAPI
 import pandas as pd
 import yfinance as yf
 import robin_stocks.robinhood as r
+import requests, io
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format='[%(levelname)s] %(message)s')
 log = logging.getLogger("stocks-backend")
@@ -159,17 +160,19 @@ def start_background_pipeline():
     ticker_thread = threading.Thread(target=initialization_and_pipeline_worker, daemon=True)
     ticker_thread.start()
 
-
 def get_sp500_tickers():
     """Scrapes Wikipedia cleanly to fetch the live 500 S&P tickers."""
     try:
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        tables = pd.read_html(url)
+        html = requests.get(
+            url, headers={"User-Agent": "portfolio-bot/1.0"}, timeout=10
+        ).text
+        tables = pd.read_html(io.StringIO(html))
         tickers = tables[0]['Symbol'].tolist()
         return [t.replace('.', '-') for t in tickers]
     except Exception as e:
         log.error("Error scraping S&P 500 list: %s", e)
-        return ["AAPL", "NVDA", "MSFT", "AMZN", "GOOGL", "META", "TSLA"] # Fallback subset
+        return ["AAPL", "NVDA", "MSFT", "AMZN", "GOOGL", "META", "TSLA"]
 
 
 def initialization_and_pipeline_worker():
