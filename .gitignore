@@ -56,3 +56,6 @@ AGENTS.md
 .vscode/
 .clangd/
 .cache/
+test
+test.cpp
+.env.bak.*
