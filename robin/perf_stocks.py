@@ -6,11 +6,16 @@ import json
 import pickle
 import logging
 import requests
+import numpy as np
 from fastapi import FastAPI
+from fastapi.responses import Response
 import pandas as pd
 import yfinance as yf
 import robin_stocks.robinhood as r
-import requests, io
+import io
+import matplotlib
+matplotlib.use("Agg")  # headless backend — the droplet has no display server
+import matplotlib.pyplot as plt
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format='[%(levelname)s] %(message)s')
 log = logging.getLogger("stocks-backend")
@@ -67,6 +72,19 @@ rh_api_lock = threading.RLock()
 # True only after the initial background login completes — prevents race condition
 # where /portfolio is served before Robinhood session is established
 session_ready = threading.Event()
+
+# ----------------------------------------------------
+# MONTE CARLO RISK ENGINE — shared state
+# ----------------------------------------------------
+RISK_CACHE = {"status": "processing", "last_updated": 0}
+risk_lock = threading.Lock()
+RISK_CHART_PATH = os.path.expanduser("~/.cache/risk_surface.png")
+
+N_PATHS = 10000    # simulated portfolio paths
+N_STEPS = 126      # trading days forward (~6 months)
+CHUNK = 2000       # paths per batch — bounds peak memory on a small droplet
+N_BINS = 60        # value buckets for the density surface
+TRADING_DAYS = 252
 
 
 def send_discord_alert(message):
@@ -280,11 +298,235 @@ def initialization_and_pipeline_worker():
                 }
             log.info("Pipeline complete. Top picks: %s", final_winners)
 
+            # Refresh the Monte Carlo risk model off the same tick
+            try:
+                risk = compute_risk_model()
+                with risk_lock:
+                    global RISK_CACHE
+                    RISK_CACHE = risk
+                if risk.get("status") == "success":
+                    log.info("Risk model updated: 95%% VaR $%.2f over %d days",
+                             risk["var_95"], risk["horizon_days"])
+                else:
+                    log.warning("Risk model skipped: %s", risk.get("message"))
+            except Exception as risk_err:
+                log.error("Risk model failed: %s", risk_err)
+
         except Exception as global_err:
             log.error("Critical error in background pipeline: %s", global_err)
         
         # Sleep 6 hours before refreshing (token is valid for ~7 days)
         time.sleep(21600)
+
+
+# ----------------------------------------------------
+# MONTE CARLO RISK ENGINE
+# ----------------------------------------------------
+
+def get_portfolio_weights():
+    """Return (tickers, weights, total_value) for the live portfolio, stocks + crypto.
+
+    Crypto symbols are mapped to Yahoo's CODE-USD convention so both asset classes
+    can be priced from one historical source.
+    """
+    with rh_api_lock:
+        ensure_authenticated()
+        holdings = r.account.build_holdings() or {}
+        positions = {}
+        for sym, h in holdings.items():
+            try:
+                eq = float(h.get("equity", 0.0))
+                if eq > 0:
+                    positions[sym] = eq
+            except (TypeError, ValueError):
+                continue
+
+        try:
+            for pos in (r.crypto.get_crypto_positions() or []):
+                qty = float(pos["quantity"])
+                if qty <= 0:
+                    continue
+                code = pos["currency"]["code"]
+                price = float(r.crypto.get_crypto_quote(code)["mark_price"])
+                positions[f"{code}-USD"] = qty * price
+        except Exception as e:
+            log.warning("Could not include crypto in risk model: %s", e)
+
+    if not positions:
+        return [], np.array([]), 0.0
+
+    tickers = sorted(positions)
+    values = np.array([positions[t] for t in tickers], dtype=np.float64)
+    total = float(values.sum())
+    return tickers, values / total, total
+
+
+def nearest_psd(cov):
+    """Clip negative eigenvalues so an almost-singular covariance still factors.
+
+    Sample covariance from short or gappy history is often not positive definite,
+    which makes np.linalg.cholesky raise. Clipping to a small positive floor is the
+    standard repair and keeps the matrix symmetric.
+    """
+    vals, vecs = np.linalg.eigh((cov + cov.T) / 2.0)
+    vals = np.clip(vals, 1e-10, None)
+    return (vecs * vals) @ vecs.T
+
+
+def compute_risk_model():
+    """Simulate the portfolio forward with correlated shocks and cache the result.
+
+    Pipeline: holdings -> aligned daily log returns -> covariance -> Cholesky factor
+    -> chunked Monte Carlo -> VaR / CVaR / drawdown + a density surface PNG.
+    """
+    tickers, weights, total_value = get_portfolio_weights()
+    if len(tickers) < 2:
+        return {"status": "error",
+                "message": "Need at least 2 holdings to estimate a covariance matrix."}
+
+    hist = yf.download(tickers, period="1y", progress=False, auto_adjust=True)
+    close = hist["Close"] if "Close" in hist else hist
+    close = close.reindex(columns=tickers).dropna(axis=1, how="all")
+
+    live = [t for t in tickers if t in close.columns]
+    if len(live) < 2:
+        return {"status": "error", "message": "Not enough price history to build a risk model."}
+
+    # Drop tickers with no history and renormalise the remaining weights
+    idx = [tickers.index(t) for t in live]
+    weights = weights[idx]
+    weights = weights / weights.sum()
+    close = close[live].dropna()
+    if len(close) < 60:
+        return {"status": "error", "message": "Fewer than 60 overlapping trading days of history."}
+
+    log_ret = np.log(close / close.shift(1)).dropna().to_numpy(dtype=np.float64)
+    mu = log_ret.mean(axis=0)
+    cov = np.cov(log_ret, rowvar=False)
+
+    try:
+        chol = np.linalg.cholesky(cov)
+    except np.linalg.LinAlgError:
+        log.warning("Covariance not positive definite — repairing via eigenvalue clipping")
+        chol = np.linalg.cholesky(nearest_psd(cov))
+
+    # Analytic portfolio moments, used to bound the histogram and to report vol
+    mu_p = float(weights @ mu)
+    sigma_p = float(np.sqrt(weights @ cov @ weights))
+    ann_vol = sigma_p * np.sqrt(TRADING_DAYS)
+
+    span = 4.0 * sigma_p * np.sqrt(N_STEPS)
+    lo = total_value * np.exp(mu_p * N_STEPS - span)
+    hi = total_value * np.exp(mu_p * N_STEPS + span)
+    edges = np.linspace(lo, hi, N_BINS + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    bin_width = edges[1] - edges[0]
+
+    counts = np.zeros((N_STEPS, N_BINS), dtype=np.int64)
+    terminal = np.empty(N_PATHS, dtype=np.float64)
+    max_dd = np.empty(N_PATHS, dtype=np.float64)
+
+    rng = np.random.default_rng(12345)
+    chol_t = chol.T.astype(np.float32)
+    mu_f = mu.astype(np.float32)
+    w_f = weights.astype(np.float32)
+
+    # Chunked so peak memory stays bounded regardless of N_PATHS
+    for start in range(0, N_PATHS, CHUNK):
+        n = min(CHUNK, N_PATHS - start)
+        z = rng.standard_normal((n, N_STEPS, len(live))).astype(np.float32)
+        shocks = z @ chol_t                      # independent -> correlated
+        port_daily = (shocks + mu_f) @ w_f       # project onto portfolio weights
+        values = total_value * np.exp(np.cumsum(port_daily, axis=1, dtype=np.float32))
+
+        running_max = np.maximum.accumulate(values, axis=1)
+        max_dd[start:start + n] = ((values - running_max) / running_max).min(axis=1)
+        terminal[start:start + n] = values[:, -1]
+
+        binned = np.clip(np.searchsorted(edges, values, side="right") - 1, 0, N_BINS - 1)
+        for t in range(N_STEPS):
+            counts[t] += np.bincount(binned[:, t], minlength=N_BINS)
+
+        del z, shocks, port_daily, values, running_max, binned
+
+    p05, p50, p95 = np.percentile(terminal, [5, 50, 95])
+    tail = terminal[terminal <= p05]
+    density = counts / (N_PATHS * bin_width)
+
+    chart_ok = render_risk_surface(density, centers, total_value, p05, p50, p95)
+
+    return {
+        "status": "success",
+        "holdings": len(live),
+        "tickers": live,
+        "total_value": round(total_value, 2),
+        "annual_vol_pct": round(ann_vol * 100, 2),
+        "var_95": round(total_value - float(p05), 2),
+        "var_95_pct": round((1 - p05 / total_value) * 100, 2),
+        "cvar_95": round(total_value - float(tail.mean()), 2),
+        "median_terminal": round(float(p50), 2),
+        "p05_terminal": round(float(p05), 2),
+        "p95_terminal": round(float(p95), 2),
+        "prob_loss_pct": round(float((terminal < total_value).mean()) * 100, 2),
+        "median_max_drawdown_pct": round(float(np.median(max_dd)) * 100, 2),
+        "horizon_days": N_STEPS,
+        "paths": N_PATHS,
+        "chart": chart_ok,
+        "last_updated": int(time.time()),
+    }
+
+
+def render_risk_surface(density, centers, start_value, p05, p50, p95):
+    """Draw the simulated value distribution as a 3D surface and save it atomically."""
+    try:
+        os.makedirs(os.path.dirname(RISK_CHART_PATH), exist_ok=True)
+        step = max(1, N_STEPS // 42)
+        rows = np.arange(0, N_STEPS, step)
+        days = rows + 1
+        grid_x, grid_y = np.meshgrid(days, centers, indexing="ij")
+        grid_z = density[rows]
+
+        fig = plt.figure(figsize=(11, 6.5), dpi=110)
+        fig.patch.set_facecolor("#1a1d21")
+        ax = fig.add_subplot(projection="3d")
+        ax.set_facecolor("#1a1d21")
+
+        ax.plot_surface(grid_x, grid_y, grid_z, cmap="viridis",
+                        rstride=1, cstride=1, linewidth=0, antialiased=True, alpha=0.92)
+
+        # Reference markers on the floor of the plot
+        floor = np.zeros_like(days, dtype=float)
+        for value, color, label in ((p05, "#ff6b6b", "5th pct"),
+                                    (p50, "#ffffff", "median"),
+                                    (p95, "#51cf66", "95th pct")):
+            ax.plot(days, np.full_like(floor, value), floor,
+                    color=color, lw=1.4, ls="--", label=f"{label}  ${value:,.0f}")
+
+        ax.set_xlabel("Trading days forward", color="#c9d1d9", labelpad=10, fontsize=9)
+        ax.set_ylabel("Portfolio value ($)", color="#c9d1d9", labelpad=14, fontsize=9)
+        ax.set_zlabel("Probability density", color="#c9d1d9", labelpad=8, fontsize=9)
+        ax.set_title(f"Simulated portfolio distribution — {N_PATHS:,} correlated paths\n"
+                     f"start ${start_value:,.0f}  ·  {N_STEPS} days  ·  Cholesky-correlated GBM",
+                     color="#f0f6fc", fontsize=11, pad=18)
+
+        for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+            axis.set_pane_color((0.11, 0.12, 0.13, 1.0))
+            axis._axinfo["grid"]["color"] = (0.3, 0.32, 0.35, 1.0)
+        ax.tick_params(colors="#8b949e", labelsize=8)
+        leg = ax.legend(loc="upper left", fontsize=8, facecolor="#22262b",
+                        edgecolor="#30363d", labelcolor="#c9d1d9")
+        leg.get_frame().set_alpha(0.9)
+        ax.view_init(elev=26, azim=-121)
+
+        tmp = RISK_CHART_PATH + ".tmp"
+        fig.savefig(tmp, facecolor=fig.get_facecolor(), bbox_inches="tight")
+        plt.close(fig)
+        os.replace(tmp, RISK_CHART_PATH)  # atomic — never serve a half-written PNG
+        return True
+    except Exception as e:
+        log.error("Failed to render risk surface: %s", e)
+        plt.close("all")
+        return False
 
 
 # ----------------------------------------------------
@@ -296,6 +538,25 @@ def get_recommendations():
     """Serves the pre-calculated recommendations list instantly via safe read locking."""
     with cache_lock:
         return RECOMMENDATIONS_CACHE
+
+
+@app.get("/risk")
+def get_risk():
+    """Serve the cached Monte Carlo risk metrics."""
+    if not session_ready.is_set():
+        return {"status": "error",
+                "message": "Robinhood session is still initializing, try again in a few seconds."}
+    with risk_lock:
+        return RISK_CACHE
+
+
+@app.get("/risk/chart.png")
+def get_risk_chart():
+    """Serve the rendered 3D density surface as raw PNG bytes."""
+    if not os.path.exists(RISK_CHART_PATH):
+        return Response(content=b"", status_code=503, media_type="image/png")
+    with open(RISK_CHART_PATH, "rb") as f:
+        return Response(content=f.read(), media_type="image/png")
 
 
 @app.get("/portfolio")

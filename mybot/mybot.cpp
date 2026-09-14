@@ -2,9 +2,26 @@
 #include <nlohmann/json.hpp>
 #include <iostream>
 #include <string>
+#include <sstream>
+#include <iomanip>
+#include <ctime>
 #include <cstdlib>
 
 using json = nlohmann::json;
+
+/* std::to_string on a double always emits 6 decimals ("1234.560000"), which looks
+   wrong in a money field. These trim it to something readable. */
+static std::string money(double v) {
+    std::ostringstream os;
+    os << std::fixed << std::setprecision(2) << v;
+    return os.str();
+}
+
+static std::string pct(double v) {
+    std::ostringstream os;
+    os << std::fixed << std::setprecision(1) << v << "%";
+    return os.str();
+}
 
 int main() {
     const char* token = std::getenv("DISCORD_BOT_TOKEN");
@@ -67,6 +84,65 @@ int main() {
             });
         } 
         
+        if (event.command.get_command_name() == "risk") {
+            event.thinking();
+
+            bot.request("http://127.0.0.1:8000/risk", dpp::m_get, [&bot, event](const dpp::http_request_completion_t& response) {
+                if (response.status != 200) {
+                    event.edit_response("Failed to contact the portfolio microservice.");
+                    return;
+                }
+
+                try {
+                    auto data = json::parse(response.body);
+                    if (data["status"] != "success") {
+                        event.edit_response("Risk model unavailable: " +
+                            data.value("message", std::string("still computing, try again shortly.")));
+                        return;
+                    }
+
+                    /* Second hop for the rendered surface. The image is fetched inside this
+                       callback so the embed and its attachment go out as one message — Discord
+                       resolves attachment:// only against files in the same payload. */
+                    bot.request("http://127.0.0.1:8000/risk/chart.png", dpp::m_get, [&bot, event, data](const dpp::http_request_completion_t& img) {
+                        double total = data["total_value"].get<double>();
+                        double var95 = data["var_95"].get<double>();
+
+                        dpp::embed embed = dpp::embed()
+                            .set_color(0x5865F2)
+                            .set_title("Portfolio Risk — Monte Carlo")
+                            .set_description(
+                                std::to_string(data["paths"].get<int>()) + " correlated paths over " +
+                                std::to_string(data["horizon_days"].get<int>()) + " trading days, drawn from the "
+                                "Cholesky factor of the covariance matrix of " +
+                                std::to_string(data["holdings"].get<int>()) + " holdings.")
+                            .add_field("95% VaR", "$" + money(var95) + "  (" + pct(data["var_95_pct"].get<double>()) + ")", true)
+                            .add_field("95% CVaR", "$" + money(data["cvar_95"].get<double>()), true)
+                            .add_field("Annualised vol", pct(data["annual_vol_pct"].get<double>()), true)
+                            .add_field("Median outcome", "$" + money(data["median_terminal"].get<double>()), true)
+                            .add_field("5th / 95th pct", "$" + money(data["p05_terminal"].get<double>()) +
+                                                         " / $" + money(data["p95_terminal"].get<double>()), true)
+                            .add_field("P(loss)", pct(data["prob_loss_pct"].get<double>()), true)
+                            .add_field("Median max drawdown", pct(data["median_max_drawdown_pct"].get<double>()), true)
+                            .add_field("Start value", "$" + money(total), true)
+                            .set_footer(dpp::embed_footer().set_text("Simulated from 1y of daily log returns"))
+                            .set_timestamp(time(0));
+
+                        dpp::message msg;
+                        if (img.status == 200 && !img.body.empty()) {
+                            msg.add_file("risk.png", img.body, "image/png");
+                            embed.set_image("attachment://risk.png");
+                        }
+                        msg.add_embed(embed);
+                        event.edit_response(msg);
+                    });
+                }
+                catch (const std::exception& e) {
+                    event.edit_response("Error parsing risk metrics.");
+                }
+            });
+        }
+
         if (event.command.get_command_name() == "recommend") {
             event.thinking();
             
@@ -122,7 +198,8 @@ int main() {
         if (dpp::run_once<struct register_bot_commands>()) {
             dpp::slashcommand portfolio("portfolio", "Check current Robinhood portfolio performance", bot.me.id);
             dpp::slashcommand recommend("recommend", "Recommendations of stocks to buy", bot.me.id);
-            bot.guild_bulk_command_create({ portfolio, recommend }, my_guild_id);
+            dpp::slashcommand risk("risk", "Monte Carlo risk model of the live portfolio", bot.me.id);
+            bot.guild_bulk_command_create({ portfolio, recommend, risk }, my_guild_id);
         }
 
         // Every 5 hours (18000 seconds), send a bot message status report.
@@ -165,6 +242,53 @@ int main() {
             }, 18000);
         }
     });
+
+    /* Connection watchdog.
+
+       The bot can sit alive with a dead gateway: the process never exits, so
+       systemd's Restart=always never fires and it silently stops posting. This
+       ran for 3+ days once. Registered here rather than inside on_ready because
+       the worst case is a bot that never connects at all, where on_ready never
+       fires and a handler registered there would never run.
+
+       Signals checked: the shard exists, reports connected, has seen READY, and
+       has ACKed a heartbeat recently (Discord's interval is ~41s). */
+    const time_t process_start = time(nullptr);
+    bot.start_timer([&bot, process_start](const dpp::timer&) {
+        static time_t unhealthy_since = 0;
+        const time_t now = time(nullptr);
+
+        if (now - process_start < 180) {
+            return; // startup grace — the first connection takes a few seconds
+        }
+
+        dpp::discord_client* shard = bot.get_shard(0);
+        const bool healthy = shard != nullptr
+                          && shard->is_connected()
+                          && shard->ready
+                          && (now - shard->last_heartbeat_ack) < 120;
+
+        if (healthy) {
+            if (unhealthy_since != 0) {
+                std::cerr << "[watchdog] gateway recovered" << std::endl;
+                unhealthy_since = 0;
+            }
+            return;
+        }
+
+        if (unhealthy_since == 0) {
+            unhealthy_since = now;
+            std::cerr << "[watchdog] gateway unhealthy, starting countdown" << std::endl;
+            return;
+        }
+
+        if (now - unhealthy_since >= 300) {
+            std::cerr << "[watchdog] gateway down " << (now - unhealthy_since)
+                      << "s — exiting for systemd to restart" << std::endl;
+            std::cerr.flush();
+            std::_Exit(1); // hard exit: skip static destructors while D++ threads are live
+        }
+    }, 60);
 
     bot.start(dpp::st_wait);
     return 0;
