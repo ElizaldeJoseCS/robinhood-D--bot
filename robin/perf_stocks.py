@@ -86,6 +86,14 @@ CHUNK = 2000       # paths per batch — bounds peak memory on a small droplet
 N_BINS = 60        # value buckets for the density surface
 TRADING_DAYS = 252
 
+# Drift handling. The sample mean of daily returns has standard error sigma/sqrt(n),
+# which over one year of daily data is roughly +/-20% annualised — the estimate is
+# mostly noise, and feeding it into a 6-month projection swamps the result. Covariance
+# converges far faster, so the risk model simulates with zero drift and reports the
+# sample drift separately as a diagnostic. This is the usual choice for VaR, where the
+# quantity of interest is dispersion rather than expected return.
+DRIFT_MODE = "zero"   # "zero" | "sample"
+
 
 def send_discord_alert(message):
     """Send an alert to the Discord channel via the bot token."""
@@ -401,8 +409,10 @@ def compute_risk_model():
         return {"status": "error", "message": "Fewer than 60 overlapping trading days of history."}
 
     log_ret = np.log(close / close.shift(1)).dropna().to_numpy(dtype=np.float64)
-    mu = log_ret.mean(axis=0)
+    n_obs = log_ret.shape[0]
+    mu_sample = log_ret.mean(axis=0)
     cov = np.cov(log_ret, rowvar=False)
+    mu = np.zeros_like(mu_sample) if DRIFT_MODE == "zero" else mu_sample
 
     try:
         chol = np.linalg.cholesky(cov)
@@ -411,13 +421,21 @@ def compute_risk_model():
         chol = np.linalg.cholesky(nearest_psd(cov))
 
     # Analytic portfolio moments, used to bound the histogram and to report vol
-    mu_p = float(weights @ mu)
     sigma_p = float(np.sqrt(weights @ cov @ weights))
     ann_vol = sigma_p * np.sqrt(TRADING_DAYS)
 
+    # How trustworthy the discarded drift estimate actually was
+    sample_drift_ann = float(weights @ mu_sample) * TRADING_DAYS
+    drift_stderr_ann = float(sigma_p * TRADING_DAYS / np.sqrt(n_obs))
+
+    # Expected SIMPLE return per asset: E[e^X]-1 for X ~ N(mu, var), then weight.
+    # Needed because the portfolio aggregates in simple-return space, not log space.
+    exp_simple = np.expm1(mu + 0.5 * np.diag(cov))
+    drift_p = float(np.log1p(weights @ exp_simple))
+
     span = 4.0 * sigma_p * np.sqrt(N_STEPS)
-    lo = total_value * np.exp(mu_p * N_STEPS - span)
-    hi = total_value * np.exp(mu_p * N_STEPS + span)
+    lo = total_value * np.exp(drift_p * N_STEPS - span)
+    hi = total_value * np.exp(drift_p * N_STEPS + span)
     edges = np.linspace(lo, hi, N_BINS + 1)
     centers = 0.5 * (edges[:-1] + edges[1:])
     bin_width = edges[1] - edges[0]
@@ -435,9 +453,15 @@ def compute_risk_model():
     for start in range(0, N_PATHS, CHUNK):
         n = min(CHUNK, N_PATHS - start)
         z = rng.standard_normal((n, N_STEPS, len(live))).astype(np.float32)
-        shocks = z @ chol_t                      # independent -> correlated
-        port_daily = (shocks + mu_f) @ w_f       # project onto portfolio weights
-        values = total_value * np.exp(np.cumsum(port_daily, axis=1, dtype=np.float32))
+        asset_log = z @ chol_t                   # independent -> correlated shocks
+        asset_log += mu_f                        # add per-asset drift
+
+        # Log returns compound over TIME but do not aggregate across ASSETS: the
+        # portfolio return is the weighted sum of SIMPLE returns. Summing log
+        # returns here would compute a geometric mean and bias every path low.
+        np.expm1(asset_log, out=asset_log)       # log return -> simple return
+        port_simple = asset_log @ w_f            # daily-rebalanced constant weights
+        values = total_value * np.cumprod(1.0 + port_simple, axis=1, dtype=np.float32)
 
         running_max = np.maximum.accumulate(values, axis=1)
         max_dd[start:start + n] = ((values - running_max) / running_max).min(axis=1)
@@ -447,7 +471,7 @@ def compute_risk_model():
         for t in range(N_STEPS):
             counts[t] += np.bincount(binned[:, t], minlength=N_BINS)
 
-        del z, shocks, port_daily, values, running_max, binned
+        del z, asset_log, port_simple, values, running_max, binned
 
     p05, p50, p95 = np.percentile(terminal, [5, 50, 95])
     tail = terminal[terminal <= p05]
@@ -471,6 +495,10 @@ def compute_risk_model():
         "median_max_drawdown_pct": round(float(np.median(max_dd)) * 100, 2),
         "horizon_days": N_STEPS,
         "paths": N_PATHS,
+        "drift_mode": DRIFT_MODE,
+        "obs_days": int(n_obs),
+        "sample_drift_annual_pct": round(sample_drift_ann * 100, 2),
+        "drift_stderr_annual_pct": round(drift_stderr_ann * 100, 2),
         "chart": chart_ok,
         "last_updated": int(time.time()),
     }
@@ -480,46 +508,61 @@ def render_risk_surface(density, centers, start_value, p05, p50, p95):
     """Draw the simulated value distribution as a 3D surface and save it atomically."""
     try:
         os.makedirs(os.path.dirname(RISK_CHART_PATH), exist_ok=True)
-        step = max(1, N_STEPS // 42)
-        rows = np.arange(0, N_STEPS, step)
+
+        # Smooth along the value axis. 10k paths spread over 60 bins leaves sampling
+        # noise that reads as surface roughness rather than as signal; a binomial
+        # kernel is the cheap standard fix and preserves the mode.
+        kernel = np.array([1.0, 4.0, 6.0, 4.0, 1.0])
+        kernel /= kernel.sum()
+        density = np.vstack([np.convolve(row, kernel, mode="same") for row in density])
+
+        # Open at one month rather than day 1. Density scales as 1/sqrt(t), so day 1 is
+        # ~11x the height of day 126 and swamps the plot; from day 21 the range is only
+        # ~2.4x, which renders as a readable fan with the true densities intact.
+        first = min(20, N_STEPS // 4)
+        step = max(1, (N_STEPS - first) // 42)
+        rows = np.arange(first, N_STEPS, step)
         days = rows + 1
         grid_x, grid_y = np.meshgrid(days, centers, indexing="ij")
-        grid_z = density[rows]
+        grid_z = density[rows].astype(np.float64)
 
         fig = plt.figure(figsize=(11, 6.5), dpi=110)
         fig.patch.set_facecolor("#1a1d21")
         ax = fig.add_subplot(projection="3d")
         ax.set_facecolor("#1a1d21")
 
-        ax.plot_surface(grid_x, grid_y, grid_z, cmap="viridis",
-                        rstride=1, cstride=1, linewidth=0, antialiased=True, alpha=0.92)
+        ax.plot_surface(grid_x, grid_y, grid_z, cmap="magma",
+                        rstride=1, cstride=1, linewidth=0, antialiased=True, alpha=0.95)
 
         # Reference markers on the floor of the plot
         floor = np.zeros_like(days, dtype=float)
-        for value, color, label in ((p05, "#ff6b6b", "5th pct"),
-                                    (p50, "#ffffff", "median"),
-                                    (p95, "#51cf66", "95th pct")):
+        for value, color, label in ((p05, "#ff5252", "5th pct"),
+                                    (p50, "#f5f5f5", "median"),
+                                    (p95, "#4ade80", "95th pct")):
             ax.plot(days, np.full_like(floor, value), floor,
-                    color=color, lw=1.4, ls="--", label=f"{label}  ${value:,.0f}")
+                    color=color, lw=2.0, ls="--", label=f"{label}  ${value:,.0f}")
 
-        ax.set_xlabel("Trading days forward", color="#c9d1d9", labelpad=10, fontsize=9)
+        ax.set_xlabel(f"Trading days forward (from day {int(days[0])})",
+                      color="#c9d1d9", labelpad=10, fontsize=9)
         ax.set_ylabel("Portfolio value ($)", color="#c9d1d9", labelpad=14, fontsize=9)
-        ax.set_zlabel("Probability density", color="#c9d1d9", labelpad=8, fontsize=9)
+        ax.set_zlabel("Probability density", color="#c9d1d9", labelpad=10, fontsize=9)
+        ax.set_zlim(0, float(grid_z.max()) * 1.05)
+        drift_note = "zero drift" if DRIFT_MODE == "zero" else "sample drift"
         ax.set_title(f"Simulated portfolio distribution — {N_PATHS:,} correlated paths\n"
-                     f"start ${start_value:,.0f}  ·  {N_STEPS} days  ·  Cholesky-correlated GBM",
+                     f"start ${start_value:,.0f}  ·  {N_STEPS} days  ·  Cholesky-correlated GBM, {drift_note}",
                      color="#f0f6fc", fontsize=11, pad=18)
 
         for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
             axis.set_pane_color((0.11, 0.12, 0.13, 1.0))
             axis._axinfo["grid"]["color"] = (0.3, 0.32, 0.35, 1.0)
         ax.tick_params(colors="#8b949e", labelsize=8)
-        leg = ax.legend(loc="upper left", fontsize=8, facecolor="#22262b",
-                        edgecolor="#30363d", labelcolor="#c9d1d9")
-        leg.get_frame().set_alpha(0.9)
-        ax.view_init(elev=26, azim=-121)
+        leg = ax.legend(loc="upper right", fontsize=8, facecolor="#22262b",
+                        edgecolor="#30363d", labelcolor="#c9d1d9",
+                        framealpha=0.9, borderpad=0.7)
+        ax.view_init(elev=28, azim=-122)
 
         tmp = RISK_CHART_PATH + ".tmp"
-        fig.savefig(tmp, facecolor=fig.get_facecolor(), bbox_inches="tight")
+        fig.savefig(tmp, format="png", facecolor=fig.get_facecolor(), bbox_inches="tight")
         plt.close(fig)
         os.replace(tmp, RISK_CHART_PATH)  # atomic — never serve a half-written PNG
         return True
