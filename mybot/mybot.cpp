@@ -6,6 +6,7 @@
 #include <iomanip>
 #include <ctime>
 #include <cstdlib>
+#include <functional>
 
 using json = nlohmann::json;
 
@@ -23,6 +24,37 @@ static std::string pct(double v) {
     return os.str();
 }
 
+/* Reports a failed edit instead of letting the interaction hang. Without this the
+   default handler logs through the cluster logger and the user just sees the
+   command think forever. */
+static dpp::command_completion_event_t report_edit(std::string tag) {
+    return [tag](const dpp::confirmation_callback_t& cc) {
+        if (cc.is_error()) {
+            std::cerr << "[" << tag << "] edit_response failed: code "
+                      << cc.get_error().code << " " << cc.get_error().message << std::endl;
+        }
+    };
+}
+
+/* Defer, THEN do the work.
+
+   thinking() is itself an async POST to Discord, and edit_response targets the
+   response that POST creates. Endpoints answered from cache return in ~3ms, which
+   is faster than the deferral round-trip, so calling edit_response straight after
+   thinking() edits a response that does not exist yet — Discord rejects it and the
+   command thinks forever. /portfolio hid this because its backend call takes ~0.9s.
+   Running the work inside thinking()'s completion callback removes the race. */
+static void defer_then(const dpp::slashcommand_t& event, std::function<void()> work) {
+    event.thinking(false, [work](const dpp::confirmation_callback_t& defer) {
+        if (defer.is_error()) {
+            std::cerr << "[defer] thinking() failed: code " << defer.get_error().code
+                      << " " << defer.get_error().message << std::endl;
+            return;
+        }
+        work();
+    });
+}
+
 int main() {
     const char* token = std::getenv("DISCORD_BOT_TOKEN");
     const char* guild_id_str = std::getenv("GUILD_ID");
@@ -38,15 +70,20 @@ int main() {
 
     dpp::cluster bot(token);
 
-    bot.on_log(dpp::utility::cout_logger());
+    /* std::cout is block-buffered when stdout is not a TTY, so cout_logger's output
+       never reached the journal and every D++ error was invisible. std::cerr is
+       unit-buffered and std::endl flushes. */
+    bot.on_log([](const dpp::log_t& log) {
+        if (log.severity >= dpp::ll_info) {
+            std::cerr << "[dpp] " << log.message << std::endl;
+        }
+    });
     
     // Listen for slash commands
     bot.on_slashcommand([&bot](const dpp::slashcommand_t& event) {
         
         if (event.command.get_command_name() == "portfolio") {
-            // Inform Discord we need an extra second to process this command
-            event.thinking();
-
+            defer_then(event, [&bot, event]() {
             bot.request("http://127.0.0.1:8000/portfolio", dpp::m_get, [&bot, event](const dpp::http_request_completion_t& response) {
                 // Check if HTTP transfer was successful
                 if (response.status != 200) {
@@ -82,11 +119,11 @@ int main() {
                     event.edit_response("Error parsing portfolio metrics.");
                 }
             });
+            });
         } 
         
         if (event.command.get_command_name() == "risk") {
-            event.thinking();
-
+            defer_then(event, [&bot, event]() {
             bot.request("http://127.0.0.1:8000/risk", dpp::m_get, [&bot, event](const dpp::http_request_completion_t& response) {
                 if (response.status != 200) {
                     event.edit_response("Failed to contact the portfolio microservice.");
@@ -105,6 +142,9 @@ int main() {
                        callback so the embed and its attachment go out as one message — Discord
                        resolves attachment:// only against files in the same payload. */
                     bot.request("http://127.0.0.1:8000/risk/chart.png", dpp::m_get, [&bot, event, data](const dpp::http_request_completion_t& img) {
+                      /* This runs on a later callback, so the outer try/catch cannot
+                         reach it — an exception here would leave the reply unsent. */
+                      try {
                         double total = data["total_value"].get<double>();
                         double var95 = data["var_95"].get<double>();
 
@@ -134,18 +174,23 @@ int main() {
                             embed.set_image("attachment://risk.png");
                         }
                         msg.add_embed(embed);
-                        event.edit_response(msg);
+                        event.edit_response(msg, report_edit("risk"));
+                      }
+                      catch (const std::exception& e) {
+                        std::cerr << "[risk] render failed: " << e.what() << std::endl;
+                        event.edit_response("Error rendering the risk model.", report_edit("risk-fallback"));
+                      }
                     });
                 }
                 catch (const std::exception& e) {
-                    event.edit_response("Error parsing risk metrics.");
+                    event.edit_response("Error parsing risk metrics.", report_edit("risk-parse"));
                 }
+            });
             });
         }
 
         if (event.command.get_command_name() == "recommend") {
-            event.thinking();
-            
+            defer_then(event, [&bot, event]() {
             bot.request("http://127.0.0.1:8000/recommendations", dpp::m_get, [&bot, event](const dpp::http_request_completion_t& response) {
                 if (response.status != 200) {
                     event.edit_response("Failed to contact portfolio microservice");
@@ -189,6 +234,7 @@ int main() {
                 catch (const std::exception& e) {
                     event.edit_response("Error parsing recommendations.");
                 }
+            });
             });
         }
     });
