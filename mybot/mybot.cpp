@@ -135,8 +135,9 @@ int main() {
             bot.request("http://127.0.0.1:8000/risk", dpp::m_get, [&bot, event, t0](const dpp::http_request_completion_t& response) {
                 std::cerr << "[risk] metrics in at " << ms_since(t0) << "ms (HTTP "
                           << response.status << ")" << std::endl;
+
                 if (response.status != 200) {
-                    event.edit_response("Failed to contact the portfolio microservice.");
+                    event.edit_response("Failed to contact the portfolio microservice.", report_edit("risk"));
                     return;
                 }
 
@@ -144,64 +145,74 @@ int main() {
                     auto data = json::parse(response.body);
                     if (data["status"] != "success") {
                         event.edit_response("Risk model unavailable: " +
-                            data.value("message", std::string("still computing, try again shortly.")));
+                            data.value("message", std::string("still computing, try again shortly.")),
+                            report_edit("risk"));
                         return;
                     }
 
-                    /* Second hop for the rendered surface. The image is fetched inside this
-                       callback so the embed and its attachment go out as one message — Discord
-                       resolves attachment:// only against files in the same payload. */
-                    bot.request("http://127.0.0.1:8000/risk/chart.png", dpp::m_get, [&bot, event, data, t0](const dpp::http_request_completion_t& img) {
-                      std::cerr << "[risk] chart in at " << ms_since(t0) << "ms ("
-                                << img.body.size() << " bytes)" << std::endl;
-                      /* This runs on a later callback, so the outer try/catch cannot
-                         reach it — an exception here would leave the reply unsent. */
-                      try {
-                        double total = data["total_value"].get<double>();
-                        double var95 = data["var_95"].get<double>();
+                    /* Read the chart off disk rather than over HTTP.
 
-                        dpp::embed embed = dpp::embed()
-                            .set_color(0x5865F2)
-                            .set_title("Portfolio Risk — Monte Carlo")
-                            .set_description(
-                                std::to_string(data["paths"].get<int>()) + " correlated paths over " +
-                                std::to_string(data["horizon_days"].get<int>()) + " trading days, drawn from the "
-                                "Cholesky factor of the covariance matrix of " +
-                                std::to_string(data["holdings"].get<int>()) + " holdings.")
-                            .add_field("95% VaR", "$" + money(var95) + "  (" + pct(data["var_95_pct"].get<double>()) + ")", true)
-                            .add_field("95% CVaR", "$" + money(data["cvar_95"].get<double>()), true)
-                            .add_field("Annualised vol", pct(data["annual_vol_pct"].get<double>()), true)
-                            .add_field("Median outcome", "$" + money(data["median_terminal"].get<double>()), true)
-                            .add_field("5th / 95th pct", "$" + money(data["p05_terminal"].get<double>()) +
-                                                         " / $" + money(data["p95_terminal"].get<double>()), true)
-                            .add_field("P(loss)", pct(data["prob_loss_pct"].get<double>()), true)
-                            .add_field("Median max drawdown", pct(data["median_max_drawdown_pct"].get<double>()), true)
-                            .add_field("Start value", "$" + money(total), true)
-                            .set_footer(dpp::embed_footer().set_text("Simulated from 1y of daily log returns"))
-                            .set_timestamp(time(0));
+                       dpp::cluster::request() truncates at a 64KB buffer boundary:
+                       an 88,523-byte PNG came back as exactly 65,536 bytes after a
+                       69-second stall, which Discord rendered as a half-decoded
+                       image. Both processes run on the same host as the same user,
+                       so the HTTP round-trip was never buying anything. */
+                    const char* env_path = std::getenv("RISK_CHART_PATH");
+                    const char* home = std::getenv("HOME");
+                    std::string chart_path = env_path ? std::string(env_path)
+                        : std::string(home ? home : ".") + "/.cache/risk_surface.png";
 
-                        dpp::message msg;
-                        if (img.status == 200 && !img.body.empty()) {
-                            msg.add_file("risk.png", img.body, "image/png");
-                            embed.set_image("attachment://risk.png");
+                    std::string png;
+                    try {
+                        png = dpp::utility::read_file(chart_path);
+                    } catch (const std::exception& e) {
+                        std::cerr << "[risk] chart unreadable at " << chart_path
+                                  << ": " << e.what() << std::endl;
+                    }
+                    std::cerr << "[risk] chart read at " << ms_since(t0) << "ms ("
+                              << png.size() << " bytes)" << std::endl;
+
+                    double total = data["total_value"].get<double>();
+                    double var95 = data["var_95"].get<double>();
+
+                    dpp::embed embed = dpp::embed()
+                        .set_color(0x5865F2)
+                        .set_title("Portfolio Risk — Monte Carlo")
+                        .set_description(
+                            std::to_string(data["paths"].get<int>()) + " correlated paths over " +
+                            std::to_string(data["horizon_days"].get<int>()) + " trading days, drawn from the "
+                            "Cholesky factor of the covariance matrix of " +
+                            std::to_string(data["holdings"].get<int>()) + " holdings.")
+                        .add_field("95% VaR", "$" + money(var95) + "  (" + pct(data["var_95_pct"].get<double>()) + ")", true)
+                        .add_field("95% CVaR", "$" + money(data["cvar_95"].get<double>()), true)
+                        .add_field("Annualised vol", pct(data["annual_vol_pct"].get<double>()), true)
+                        .add_field("Median outcome", "$" + money(data["median_terminal"].get<double>()), true)
+                        .add_field("5th / 95th pct", "$" + money(data["p05_terminal"].get<double>()) +
+                                                     " / $" + money(data["p95_terminal"].get<double>()), true)
+                        .add_field("P(loss)", pct(data["prob_loss_pct"].get<double>()), true)
+                        .add_field("Median max drawdown", pct(data["median_max_drawdown_pct"].get<double>()), true)
+                        .add_field("Start value", "$" + money(total), true)
+                        .set_footer(dpp::embed_footer().set_text("Simulated from 1y of daily log returns"))
+                        .set_timestamp(time(0));
+
+                    dpp::message msg;
+                    if (!png.empty()) {
+                        msg.add_file("risk.png", png, "image/png");
+                        embed.set_image("attachment://risk.png");
+                    }
+                    msg.add_embed(embed);
+
+                    event.edit_response(msg, [t0](const dpp::confirmation_callback_t& cc) {
+                        if (cc.is_error()) {
+                            std::cerr << "[risk] edit failed: code " << cc.get_error().code
+                                      << " " << cc.get_error().message << std::endl;
+                        } else {
+                            std::cerr << "[risk] delivered at " << ms_since(t0) << "ms" << std::endl;
                         }
-                        msg.add_embed(embed);
-                        event.edit_response(msg, [t0](const dpp::confirmation_callback_t& cc) {
-                            if (cc.is_error()) {
-                                std::cerr << "[risk] edit failed: code " << cc.get_error().code
-                                          << " " << cc.get_error().message << std::endl;
-                            } else {
-                                std::cerr << "[risk] delivered at " << ms_since(t0) << "ms" << std::endl;
-                            }
-                        });
-                      }
-                      catch (const std::exception& e) {
-                        std::cerr << "[risk] render failed: " << e.what() << std::endl;
-                        event.edit_response("Error rendering the risk model.", report_edit("risk-fallback"));
-                      }
                     });
                 }
                 catch (const std::exception& e) {
+                    std::cerr << "[risk] failed: " << e.what() << std::endl;
                     event.edit_response("Error parsing risk metrics.", report_edit("risk-parse"));
                 }
             });
