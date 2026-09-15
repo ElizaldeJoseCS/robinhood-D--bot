@@ -7,6 +7,7 @@
 #include <ctime>
 #include <cstdlib>
 #include <functional>
+#include <chrono>
 
 using json = nlohmann::json;
 
@@ -22,6 +23,11 @@ static std::string pct(double v) {
     std::ostringstream os;
     os << std::fixed << std::setprecision(1) << v << "%";
     return os.str();
+}
+
+static long ms_since(const std::chrono::steady_clock::time_point& t) {
+    return (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t).count();
 }
 
 /* Reports a failed edit instead of letting the interaction hang. Without this the
@@ -123,8 +129,12 @@ int main() {
         } 
         
         if (event.command.get_command_name() == "risk") {
-            defer_then(event, [&bot, event]() {
-            bot.request("http://127.0.0.1:8000/risk", dpp::m_get, [&bot, event](const dpp::http_request_completion_t& response) {
+            const auto t0 = std::chrono::steady_clock::now();
+            defer_then(event, [&bot, event, t0]() {
+            std::cerr << "[risk] deferral acked at " << ms_since(t0) << "ms" << std::endl;
+            bot.request("http://127.0.0.1:8000/risk", dpp::m_get, [&bot, event, t0](const dpp::http_request_completion_t& response) {
+                std::cerr << "[risk] metrics in at " << ms_since(t0) << "ms (HTTP "
+                          << response.status << ")" << std::endl;
                 if (response.status != 200) {
                     event.edit_response("Failed to contact the portfolio microservice.");
                     return;
@@ -141,7 +151,9 @@ int main() {
                     /* Second hop for the rendered surface. The image is fetched inside this
                        callback so the embed and its attachment go out as one message — Discord
                        resolves attachment:// only against files in the same payload. */
-                    bot.request("http://127.0.0.1:8000/risk/chart.png", dpp::m_get, [&bot, event, data](const dpp::http_request_completion_t& img) {
+                    bot.request("http://127.0.0.1:8000/risk/chart.png", dpp::m_get, [&bot, event, data, t0](const dpp::http_request_completion_t& img) {
+                      std::cerr << "[risk] chart in at " << ms_since(t0) << "ms ("
+                                << img.body.size() << " bytes)" << std::endl;
                       /* This runs on a later callback, so the outer try/catch cannot
                          reach it — an exception here would leave the reply unsent. */
                       try {
@@ -174,7 +186,14 @@ int main() {
                             embed.set_image("attachment://risk.png");
                         }
                         msg.add_embed(embed);
-                        event.edit_response(msg, report_edit("risk"));
+                        event.edit_response(msg, [t0](const dpp::confirmation_callback_t& cc) {
+                            if (cc.is_error()) {
+                                std::cerr << "[risk] edit failed: code " << cc.get_error().code
+                                          << " " << cc.get_error().message << std::endl;
+                            } else {
+                                std::cerr << "[risk] delivered at " << ms_since(t0) << "ms" << std::endl;
+                            }
+                        });
                       }
                       catch (const std::exception& e) {
                         std::cerr << "[risk] render failed: " << e.what() << std::endl;

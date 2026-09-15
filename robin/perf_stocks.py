@@ -526,7 +526,7 @@ def render_risk_surface(density, centers, start_value, p05, p50, p95):
         grid_x, grid_y = np.meshgrid(days, centers, indexing="ij")
         grid_z = density[rows].astype(np.float64)
 
-        fig = plt.figure(figsize=(11, 6.5), dpi=110)
+        fig = plt.figure(figsize=(11, 6.5), dpi=145)
         fig.patch.set_facecolor("#1a1d21")
         ax = fig.add_subplot(projection="3d")
         ax.set_facecolor("#1a1d21")
@@ -561,9 +561,20 @@ def render_risk_surface(density, centers, start_value, p05, p50, p95):
                         framealpha=0.9, borderpad=0.7)
         ax.view_init(elev=28, azim=-122)
 
+        # A 3D axes leaves wide margins, so the frame is cropped to the drawing and
+        # the dpi raised to compensate — cropping at the old dpi produced a 617x656
+        # image whose labels were soft once Discord scaled it.
         tmp = RISK_CHART_PATH + ".tmp"
         fig.savefig(tmp, format="png", facecolor=fig.get_facecolor(), bbox_inches="tight")
         plt.close(fig)
+
+        # RGBA surface plots encode badly: ~184KB for a small frame. A 256-colour
+        # palette is visually identical here and about a third of the size, which is
+        # what a Discord client actually has to download before the embed renders.
+        from PIL import Image
+        Image.open(tmp).convert("RGB").quantize(colors=256).save(
+            tmp, format="PNG", optimize=True)
+
         os.replace(tmp, RISK_CHART_PATH)  # atomic — never serve a half-written PNG
         return True
     except Exception as e:
